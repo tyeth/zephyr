@@ -225,6 +225,36 @@ static int cybt_to_errno(int ret)
 /* ------------------------------------------------ transport bring-up (lazy) */
 
 /*
+ * Number of times the patchram download + handshake is attempted before giving
+ * up. A warm bring-up (after the chip has slept) intermittently reads the BT
+ * shared-memory ring state back as zero/garbage, which cybt now rejects rather
+ * than proceeding into a controller command timeout and a BT_ASSERT halt. Each
+ * attempt re-downloads the patchram from scratch, and the failure is
+ * independent between attempts, so a couple of retries turn an intermittent
+ * bring-up into a reliable one.
+ */
+#define CYW43_BT_INIT_RETRIES 4
+
+/*
+ * Fetch the BT shared-memory base the way WHD's own shared-bus support does:
+ * the bus:btsdiobufaddr iovar, over the WLAN command path. On a Pico 2 W this
+ * returns a valid base even when the raw WLAN_RAM_BASE register reads back 0
+ * after the chip has slept. Returns 0 if it cannot be obtained (cybt then
+ * falls back to the register). MUST be called WITHOUT the shared bus lock held:
+ * the iovar round-trips through WHD's own thread, which needs the same bus
+ * lock, so holding it here would deadlock.
+ */
+static uint32_t cyw43_bt_fetch_ram_base(whd_driver_t drv)
+{
+	struct whd_bt_info info;
+
+	if (whd_get_bt_info(drv, &info) == WHD_SUCCESS && info.wlan_buf_addr != 0) {
+		return info.wlan_buf_addr;
+	}
+	return 0;
+}
+
+/*
  * WHD already powered the chip and brought the backplane up during AIROC init
  * (whd_wifi_on), so bring-up here only has to download the BT patchram, once,
  * on the first BT operation.
@@ -233,7 +263,8 @@ static int cyw43_bt_ensure_up(void)
 {
 	whd_interface_t ifp;
 	whd_mac_t mac;
-	int ret;
+	int ret = CYBT_ERR_HCI_INIT_FAILED;
+	int attempt;
 
 	if (cyw43_bt_state.bt_loaded) {
 		return 0;
@@ -252,11 +283,27 @@ static int cyw43_bt_ensure_up(void)
 		LOG_WRN("whd_wifi_get_mac_address failed; BD_ADDR check may not match");
 	}
 
-	whd_bus_lock();
-	ret = cyw43_btbus_init(CYW43_BT_LL_HANDLE);
-	whd_bus_unlock();
+	for (attempt = 0; attempt < CYW43_BT_INIT_RETRIES; attempt++) {
+		uint32_t base;
+
+		/* Outside the bus lock: this round-trips through WHD's thread. */
+		base = cyw43_bt_fetch_ram_base(ifp->whd_driver);
+
+		whd_bus_lock();
+		cybt_set_wlan_ram_base(base);
+		ret = cyw43_btbus_init(CYW43_BT_LL_HANDLE);
+		whd_bus_unlock();
+
+		if (ret == CYBT_SUCCESS) {
+			break;
+		}
+		LOG_WRN("BT bring-up attempt %d/%d failed (cybt %d, ram_base 0x%08x); retrying",
+			attempt + 1, CYW43_BT_INIT_RETRIES, ret, base);
+		k_msleep(50);
+	}
 	if (ret != CYBT_SUCCESS) {
-		LOG_ERR("cyw43_btbus_init (BT patchram download) failed: cybt %d", ret);
+		LOG_ERR("cyw43_btbus_init (BT patchram download) failed after %d attempts: cybt %d",
+			CYW43_BT_INIT_RETRIES, ret);
 		return cybt_to_errno(ret);
 	}
 

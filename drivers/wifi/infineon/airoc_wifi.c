@@ -9,6 +9,7 @@
  * @brief AIROC Wi-Fi driver.
  */
 
+#include <zephyr/sys/atomic.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/conn_mgr/connectivity_wifi_mgmt.h>
 #include <airoc_wifi.h>
@@ -18,11 +19,11 @@
 LOG_MODULE_REGISTER(infineon_airoc_wifi, CONFIG_WIFI_LOG_LEVEL);
 
 #ifndef AIROC_WIFI_TX_PACKET_POOL_COUNT
-#define AIROC_WIFI_TX_PACKET_POOL_COUNT (10)
+#define AIROC_WIFI_TX_PACKET_POOL_COUNT CONFIG_AIROC_WIFI_TX_PACKET_POOL_COUNT
 #endif
 
 #ifndef AIROC_WIFI_RX_PACKET_POOL_COUNT
-#define AIROC_WIFI_RX_PACKET_POOL_COUNT (10)
+#define AIROC_WIFI_RX_PACKET_POOL_COUNT CONFIG_AIROC_WIFI_RX_PACKET_POOL_COUNT
 #endif
 
 #ifndef AIROC_WIFI_PACKET_POOL_SIZE
@@ -64,6 +65,24 @@ int airoc_wifi_init_primary(const struct device *dev, whd_interface_t *interface
 /* Allocate network pool */
 NET_BUF_POOL_FIXED_DEFINE(airoc_pool, AIROC_WIFI_PACKET_POOL_COUNT, AIROC_WIFI_PACKET_POOL_SIZE, 0,
 			  NULL);
+
+/*
+ * Coexistence buffer arbitration.
+ *
+ * airoc_pool is shared by WiFi RX/TX and, on boards where Bluetooth runs over
+ * this same WHD bus, by every BT backplane transfer
+ * (whd_bus_transfer_backplane_bytes). Under WiFi+BT bus contention the WHD
+ * SDPCM TX queue stalls and queued WiFi TX buffers accumulate until they
+ * consume the whole pool; the BT backplane allocation then fails and the BLE
+ * link drops. Track in-flight buffers so WiFi *data* TX can yield once the pool
+ * falls to a small reserve, leaving buffers for the BT backplane and for WiFi
+ * RX/control. A dropped TX is retransmitted by the net stack, so WiFi
+ * throughput dips rather than Bluetooth failing.
+ */
+static atomic_t airoc_pool_inflight;
+#define AIROC_POOL_BT_RESERVE 6
+BUILD_ASSERT(AIROC_WIFI_PACKET_POOL_COUNT > AIROC_POOL_BT_RESERVE,
+	     "WHD pool must leave data buffers beyond the Bluetooth reserve");
 
 /* AIROC globals */
 static uint16_t ap_event_handler_index = 0xFF;
@@ -391,6 +410,7 @@ static whd_result_t airoc_wifi_host_buffer_get(whd_buffer_t *buffer, whd_buffer_
 		net_buf_unref(buf);
 		return WHD_BUFFER_ALLOC_FAIL;
 	}
+	atomic_inc(&airoc_pool_inflight);
 	*buffer = buf;
 
 	/* Set buffer size */
@@ -402,6 +422,7 @@ static whd_result_t airoc_wifi_host_buffer_get(whd_buffer_t *buffer, whd_buffer_
 static void airoc_wifi_buffer_release(whd_buffer_t buffer, whd_buffer_dir_t direction)
 {
 	CY_UNUSED_PARAMETER(direction);
+	atomic_dec(&airoc_pool_inflight);
 	(void)net_buf_destroy((struct net_buf *)buffer);
 }
 
@@ -452,6 +473,19 @@ static int airoc_mgmt_send(const struct device *dev, struct net_pkt *pkt)
 	cy_rslt_t ret;
 	size_t pkt_len = net_pkt_get_len(pkt);
 	struct net_buf *buf = NULL;
+
+	/*
+	 * Keep a few pool buffers in reserve so a stalled WHD TX queue cannot
+	 * drain the shared pool and starve the BT backplane. Dropping this TX is
+	 * preferable: the net stack retransmits.
+	 */
+	if (atomic_get(&airoc_pool_inflight) >=
+	    (AIROC_WIFI_PACKET_POOL_COUNT - AIROC_POOL_BT_RESERVE)) {
+#if defined(CONFIG_NET_STATISTICS_WIFI)
+		data->stats.errors.tx++;
+#endif
+		return -ENOMEM;
+	}
 
 	/* Read the packet payload */
 	if (net_pkt_read(pkt, data->frame_buf, pkt_len) < 0) {
@@ -797,17 +831,50 @@ static void airoc_event_task(void)
 		}
 #endif
 #endif
-		switch ((whd_event_num_t)event_header.event_type) {
-		case WLC_E_LINK:
-			break;
+		if (airoc_event.is_ap_event) {
+			/*
+			 * Events registered by ap_enable() are about stations joining
+			 * or leaving our own AP. A station's deauth must not take the
+			 * interface dormant the way a lost STA link (below) does --
+			 * that silently killed the AP's IP traffic the moment the
+			 * first client left. Without wpa_supplicant nothing else turns
+			 * these into wifi_mgmt events, so raise them here; with it,
+			 * hostapd reports them through its own callbacks.
+			 */
+#if !defined(CONFIG_WIFI_NM_WPA_SUPPLICANT)
+			struct wifi_ap_sta_info sta_info = {
+				.link_mode = WIFI_LINK_MODE_UNKNOWN,
+				.mac_length = WIFI_MAC_ADDR_LEN,
+			};
 
-		case WLC_E_DEAUTH_IND:
-		case WLC_E_DISASSOC_IND:
-			net_if_dormant_on(airoc_wifi_iface);
-			break;
+			memcpy(sta_info.mac, event_header.addr.octet, WIFI_MAC_ADDR_LEN);
 
-		default:
-			break;
+			switch ((whd_event_num_t)event_header.event_type) {
+			case WLC_E_ASSOC_IND:
+			case WLC_E_REASSOC_IND:
+				wifi_mgmt_raise_ap_sta_connected_event(airoc_wifi_iface, &sta_info);
+				break;
+			case WLC_E_DEAUTH_IND:
+			case WLC_E_DISASSOC_IND:
+				wifi_mgmt_raise_ap_sta_disconnected_event(airoc_wifi_iface, &sta_info);
+				break;
+			default:
+				break;
+			}
+#endif
+		} else {
+			switch ((whd_event_num_t)event_header.event_type) {
+			case WLC_E_LINK:
+				break;
+
+			case WLC_E_DEAUTH_IND:
+			case WLC_E_DISASSOC_IND:
+				net_if_dormant_on(airoc_wifi_iface);
+				break;
+
+			default:
+				break;
+			}
 		}
 		if (airoc_event.whd_event_data) {
 			if (airoc_event.whd_event_data->event_header) {
@@ -1090,34 +1157,33 @@ static int airoc_mgmt_ap_enable(const struct device *dev,
 	ssid.length = params->ssid_length;
 	memcpy(ssid.value, params->ssid, ssid.length);
 
-	/* make sure to set valid channels for 2G and 5G:
+	/*
+	 * whd_wifi_init_ap() takes a bare channel number: it builds the chanspec
+	 * itself with CH20MHZ_CHSPEC(), which picks the band by comparing the
+	 * value against CH_MAX_2G_CHANNEL and ORs in the 20 MHz bandwidth bits.
+	 * Handing it a value that already carries band and bandwidth bits (as this
+	 * function used to) makes that comparison see a "channel" of 0x1001 and
+	 * classify every 2.4 GHz channel as 5 GHz, so the firmware rejected the
+	 * resulting chanspec (0xd001 for channel 1) with WLAN_BADCHAN and no AP
+	 * could ever start. Keep the validation, drop the composition; only 20 MHz
+	 * is expressible through this WHD entry point.
+	 *
+	 * make sure to set valid channels for 2G and 5G:
 	 * - 2G channels from 1 to 11,
 	 * - 5G channels from 36 to 165
 	 */
-	if ((params->channel > 0) && (params->channel < 12)) {
-		chanspec = params->channel | GET_C_VAR(airoc_ap_if->whd_driver, CHANSPEC_BAND_2G);
-	} else if ((params->channel > 35) && (params->channel < 166)) {
-		chanspec = params->channel | GET_C_VAR(airoc_ap_if->whd_driver, CHANSPEC_BAND_5G);
+	if (((params->channel > 0) && (params->channel < 12)) ||
+	    ((params->channel > 35) && (params->channel < 166))) {
+		chanspec = params->channel;
 	} else {
-		chanspec = 1 | GET_C_VAR(airoc_ap_if->whd_driver, CHANSPEC_BAND_2G);
+		chanspec = 1;
 		LOG_WRN("Discard of setting unsupported channel: %u (will set 1)", params->channel);
 	}
 
-	switch (params->bandwidth) {
-	case WIFI_FREQ_BANDWIDTH_20MHZ:
-		chanspec |= GET_C_VAR(airoc_ap_if->whd_driver, CHANSPEC_BW_20);
-		break;
-	case WIFI_FREQ_BANDWIDTH_40MHZ:
-		chanspec |= GET_C_VAR(airoc_ap_if->whd_driver, CHANSPEC_BW_40);
-		break;
-	case WIFI_FREQ_BANDWIDTH_80MHZ:
-		chanspec |= GET_C_VAR(airoc_ap_if->whd_driver, CHANSPEC_BW_80);
-		break;
-	default:
-		chanspec |= GET_C_VAR(airoc_ap_if->whd_driver, CHANSPEC_BW_20);
+	if (params->bandwidth != WIFI_FREQ_BANDWIDTH_20MHZ &&
+	    params->bandwidth != WIFI_FREQ_BANDWIDTH_UNKNOWN) {
 		LOG_WRN("Discard of setting unsupported bandwidth: %u (will set 20MHz)",
 			params->bandwidth);
-		break;
 	}
 
 	switch (params->security) {
